@@ -153,7 +153,7 @@ jobs:
             root=/opt/rocm
             [ -x "$root/bin/hipcc" ] || { echo "::error::torch bundles ROCm and the host has no $root/bin/hipcc"; exit 1; }
             echo "ROCM_HOME=$root" >> "$GITHUB_ENV"
-            toolchain="host $(cat "$root/.info/version" 2>/dev/null || readlink -f "$root")"
+            toolchain="host $root, HIP $("$root/bin/hipconfig" --version 2>/dev/null || echo unknown)"
           fi
           echo "toolchain: $toolchain ($root)"
           echo "$toolchain" > "$OUT/toolchain.txt"
