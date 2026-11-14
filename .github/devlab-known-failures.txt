@@ -18,3 +18,4 @@ tests/conversion/test_out_scales.py::test_hessian_scales_move_the_error | loss r
 # ROCm-specific
 tests/kernels/attention/test_qc_staging_slices.py::test_qc_staging_slices*-D256* | gfx1151: quantized-cache prefill (head_dim 256) Triton kernel needs 128 KB LDS, device has 64 KB (OutOfResources) | not filed
 tests/kernels/moe_cpu_host/test_moe_worker.py::test_gpu_driven_jobs*memops-* | gfx1201: GPU-driven jobs synchronized by stream wait/write-value memops return wrong outputs with HIP 7.14-7.17 (pass with HIP 7.2; kernel flags pass) | not filed
+tests/kernels/ple/test_ple_kernels.py::test_ple_forward_streams?*-2-1-* | gfx1201 + torch rocm7.2 only: fp16 depthwise conv1d (ksize 2, dilation 1) off the fp64 reference in torch alone (MIOpen 7.2); passes with HIP 7.14+ | not filed
