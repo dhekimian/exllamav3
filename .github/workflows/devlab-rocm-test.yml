@@ -214,12 +214,12 @@ jobs:
           . "$VENV/bin/activate"
           cd "$RUNNER_TEMP"   # import the installed package, not the checkout
           python -u - <<'PY'
-          import faulthandler, json, os
+          import faulthandler, importlib.metadata, json, os
           faulthandler.enable()
           import torch, exllamav3, exllamav3_ext
           p = torch.cuda.get_device_properties(0)
           info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
-                  "arch": p.gcnArchName, "exllamav3": exllamav3.__version__,
+                  "arch": p.gcnArchName, "exllamav3": importlib.metadata.version("exllamav3"),
                   "ext": exllamav3_ext.__file__,
                   "toolchain": open(os.path.join(os.environ["OUT"], "toolchain.txt")).read().strip(),
                   "cxx": os.environ.get("CXX", "c++")}
