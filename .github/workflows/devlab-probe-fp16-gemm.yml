@@ -1,0 +1,64 @@
+# One-off probe (dispatch only): torch alone, no exllamav3. fp16 matmuls of the
+# shapes ple_forward_streams projects (rows x 64 @ 64 x {1024, 256}) against a
+# float64 reference, on the R9700 with a given torch ROCm build.
+name: DevLab probe - fp16 GEMM accuracy
+
+on:
+  workflow_dispatch:
+    inputs:
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm7.2
+      gpu:
+        description: Runner label
+        default: radeon-r9700
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ inputs.gpu }}"]
+    timeout-minutes: 30
+    env:
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
+    steps:
+      - name: Install torch
+        run: |
+          set -euo pipefail
+          python3 -m venv venv && . venv/bin/activate
+          pip install -q --upgrade pip
+          INDEX="$TORCH_INDEX_URL"; EXTRA=()
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"; INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+          fi
+          PIP_CONFIG_FILE=/dev/null pip install -q torch numpy --index-url "$INDEX" "${EXTRA[@]}"
+      - name: fp16 GEMM vs float64
+        run: |
+          . venv/bin/activate
+          python -u - <<'PY'
+          import faulthandler, torch
+          faulthandler.enable()
+          p = torch.cuda.get_device_properties(0)
+          print(torch.__version__, torch.version.hip, p.name, p.gcnArchName)
+          g = torch.Generator().manual_seed(0)
+          bad = 0
+          for n in (1024, 256):
+              for rows in list(range(1, 17)) + [20, 24, 32, 40, 48, 64, 80, 120, 128]:
+                  a = torch.randn(rows, 64, generator=g).half()
+                  b = (torch.randn(64, n, generator=g) / 8).half()
+                  ref = a.double() @ b.double()
+                  out = (a.cuda() @ b.cuda()).double().cpu()
+                  # fp16 output: allow 2 ulp of the result plus a small absolute term
+                  tol = 2 * 2.0 ** -10 * ref.abs() + 1e-3
+                  nbad = int(((out - ref).abs() > tol).sum())
+                  rows_bad = sorted(set(((out - ref).abs() > tol).nonzero()[:, 0].tolist()))
+                  if nbad:
+                      bad += 1
+                      print(f"MISMATCH rows={rows} n={n}: {nbad} elements, bad rows {rows_bad[:10]}, "
+                            f"max abs err {(out - ref).abs().max().item():.3g}")
+          print("cases with mismatches:", bad)
+          PY
