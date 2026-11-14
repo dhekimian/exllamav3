@@ -37,6 +37,9 @@ on:
       pytest_k:
         description: Optional pytest -k expression (e.g. to rerun one failing test)
         default: ""
+      toolchain_image:
+        description: Image the ROCm compiler comes from when torch bundles ROCm (no ROCm SDK wheels)
+        default: rocm/dev-ubuntu-24.04:7.2.4-complete
       host_cxx:
         description: Host C++ compiler for the .cpp sources (clang = the ROCm toolchain's clang++, default = the system c++)
         default: clang
@@ -46,6 +49,7 @@ on:
       torch_spec: {type: string, default: "torch"}
       torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm10.0}
       tests_per_file: {type: string, default: "0"}
+      toolchain_image: {type: string, default: "rocm/dev-ubuntu-24.04:7.2.4-complete"}
       label: {type: string, default: release}
 
 permissions:
@@ -70,6 +74,7 @@ jobs:
       PER_FILE: ${{ inputs.tests_per_file || '0' }}
       PYTEST_K: ${{ inputs.pytest_k || '' }}
       HOST_CXX: ${{ inputs.host_cxx || 'clang' }}
+      TOOLCHAIN_IMAGE: ${{ inputs.toolchain_image || 'rocm/dev-ubuntu-24.04:7.2.4-complete' }}
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
@@ -150,10 +155,23 @@ jobs:
             root=$(python -m rocm_sdk path --root)
             toolchain="rocm-sdk $rocm_ver"
           else
-            root=/opt/rocm
-            [ -x "$root/bin/hipcc" ] || { echo "::error::torch bundles ROCm and the host has no $root/bin/hipcc"; exit 1; }
-            echo "ROCM_HOME=$root" >> "$GITHUB_ENV"
-            toolchain="host $root, HIP $("$root/bin/hipconfig" --version 2>/dev/null || echo unknown)"
+            # torch bundles its ROCm runtime and there is no SDK wheel for that
+            # ROCm: take the matching ROCm install out of AMD's dev image (the
+            # compiler, headers and link libraries; not the kernel libraries,
+            # which torch brings). The host's own ROCm is a different release.
+            img="$TOOLCHAIN_IMAGE"
+            docker pull -q "$img"
+            real=$(docker run --rm --network host "$img" readlink -f /opt/rocm)
+            root="$RUNNER_TEMP/rocm"
+            mkdir -p "$root"
+            docker run --rm --network host "$img" tar -C "$real" -cf - \
+                --exclude='lib/rocblas/library' --exclude='lib/hipblaslt/library' \
+                --exclude='lib/hipsparselt/library' --exclude='share/miopen' --exclude='lib/rocfft' \
+                --exclude='share/doc' --exclude='lib/*.a' . | tar -C "$root" -xf -
+            [ -x "$root/bin/hipcc" ] || { echo "::error::no hipcc in $img"; exit 1; }
+            { echo "ROCM_HOME=$root"; echo "ROCM_PATH=$root"; echo "HIP_PATH=$root"; } >> "$GITHUB_ENV"
+            export ROCM_PATH="$root" HIP_PATH="$root"
+            toolchain="$img, HIP $("$root/bin/hipconfig" --version 2>/dev/null || echo unknown)"
           fi
           echo "toolchain: $toolchain ($root)"
           echo "$toolchain" > "$OUT/toolchain.txt"
@@ -221,6 +239,9 @@ jobs:
           info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
                   "arch": p.gcnArchName, "exllamav3": importlib.metadata.version("exllamav3"),
                   "ext": exllamav3_ext.__file__,
+                  "lds_per_block": getattr(p, "shared_memory_per_block", None),
+                  "lds_per_block_optin": getattr(p, "shared_memory_per_block_optin", None),
+                  "lds_per_cu": getattr(p, "shared_memory_per_multiprocessor", None),
                   "toolchain": open(os.path.join(os.environ["OUT"], "toolchain.txt")).read().strip(),
                   "cxx": os.environ.get("CXX", "c++")}
           print(info)
