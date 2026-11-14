@@ -17,4 +17,4 @@ tests/conversion/test_out_scales.py::test_hessian_scales_move_the_error | loss r
 
 # ROCm-specific
 tests/kernels/attention/test_qc_staging_slices.py::test_qc_staging_slices*-D256* | gfx1151: quantized-cache prefill (head_dim 256) Triton kernel needs 128 KB LDS, device has 64 KB (OutOfResources) | not filed
-tests/kernels/moe_cpu_host/test_moe_worker.py::test_gpu_driven_jobs*memops-* | gfx1201: GPU-driven jobs synchronized by stream wait/write-value memops return wrong outputs (kernel flags pass); R9700 VM, bare metal unverified | not filed
+tests/kernels/moe_cpu_host/test_moe_worker.py::test_gpu_driven_jobs*memops-* | gfx1201: GPU-driven jobs synchronized by stream wait/write-value memops return wrong outputs with HIP 7.14-7.17 (pass with HIP 7.2; kernel flags pass) | not filed

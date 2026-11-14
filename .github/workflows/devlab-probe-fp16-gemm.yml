@@ -1,7 +1,7 @@
-# One-off probe (dispatch only): torch alone, no exllamav3. fp16 matmuls of the
-# shapes ple_forward_streams projects (rows x 64 @ 64 x {1024, 256}) against a
-# float64 reference, on the R9700 with a given torch ROCm build.
-name: DevLab probe - fp16 GEMM accuracy
+# One-off probe (dispatch only): torch alone, no exllamav3. The fp16 matmuls and
+# the depthwise conv1d that ple_forward_streams runs, against a float64
+# reference, on the R9700 with a given torch ROCm build.
+name: DevLab probe - fp16 GEMM and conv1d accuracy
 
 on:
   workflow_dispatch:
@@ -61,4 +61,22 @@ jobs:
                       print(f"MISMATCH rows={rows} n={n}: {nbad} elements, bad rows {rows_bad[:10]}, "
                             f"max abs err {(out - ref).abs().max().item():.3g}")
           print("cases with mismatches:", bad)
+          # Depthwise causal conv1d as ple_forward_streams runs it: (bsz, C, state + seq) half,
+          # weight (C, 1, ksize), groups = C, no padding
+          cbad = 0
+          for C in (1024, 256):
+              for ksize, dil in ((1, 3), (2, 1), (4, 2), (4, 3)):
+                  for bsz, seq in ((1, 1), (1, 5), (2, 3), (1, 40), (3, 1)):
+                      L = (ksize - 1) * dil + seq
+                      x = torch.randn(bsz, C, L, generator=g).half()
+                      w = (torch.randn(C, 1, ksize, generator=g) / 2).half()
+                      ref = torch.nn.functional.conv1d(x.double(), w.double(), None, 1, 0, dil, C)
+                      out = torch.nn.functional.conv1d(x.cuda(), w.cuda(), None, 1, 0, dil, C).double().cpu()
+                      tol = 2 * 2.0 ** -10 * ref.abs() + 1e-3
+                      nbad = int(((out - ref).abs() > tol).sum())
+                      if nbad:
+                          cbad += 1
+                          print(f"CONV MISMATCH C={C} ksize={ksize} dil={dil} bsz={bsz} seq={seq}: {nbad}/{ref.numel()} "
+                                f"elements, max abs err {(out - ref).abs().max().item():.3g}")
+          print("conv cases with mismatches:", cbad)
           PY
