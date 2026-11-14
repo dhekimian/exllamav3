@@ -1,0 +1,3 @@
+# Failures classified as upstream bugs (see the DevLab findings). One per line:
+#   <fnmatch pattern on the pytest node id> | <reason, one line> | <upstream issue URL, or "not filed">
+# A failure listed here is reported as a warning; anything else fails the job.

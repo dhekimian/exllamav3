@@ -1,0 +1,381 @@
+# Build exllamav3's HIP extension and run its own test suite on real consumer
+# AMD GPUs.
+#
+# Upstream builds ROCm wheels (gfx10/11/12 generic targets) but only imports
+# them on a GPU-less runner; no workflow runs the test suite on a device. This
+# job builds the extension from source for one architecture with ROCm torch on
+# a Radeon 8060S (Strix Halo, gfx1151) and a Radeon AI PRO R9700 (gfx1201),
+# checks that the extension loads on the expected GPU, and runs the
+# self-contained tier of tests/ (`-m "not model"`: synthetic weights, no
+# checkpoints to download).
+#
+# Every run uploads summary.json (versions, toolchain, build result, pass/fail
+# counts) so results compare across releases; other workflows call this one
+# for a ROCm/torch matrix (workflow_call).
+#
+# Runners: AMD DevLab, a donated pool of single-use machines. One job per
+# machine; nothing persists between jobs.
+name: ROCm test (gfx1151, gfx1201)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and test (empty = the ref this run is on)
+        default: ""
+      torch_spec:
+        description: torch requirement ({gfx} is replaced by the job's target)
+        default: torch
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm10.0
+      tests_per_file:
+        description: Test cases to run per test file (0 = all)
+        default: "0"
+      pytest_k:
+        description: Optional pytest -k expression (e.g. to rerun one failing test)
+        default: ""
+      host_cxx:
+        description: Host C++ compiler for the .cpp sources (clang = the ROCm toolchain's clang++, default = the system c++)
+        default: clang
+  workflow_call:
+    inputs:
+      ref: {type: string, default: ""}
+      torch_spec: {type: string, default: "torch"}
+      torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm10.0}
+      tests_per_file: {type: string, default: "0"}
+      label: {type: string, default: release}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 150
+    env:
+      TORCH_SPEC: ${{ inputs.torch_spec || 'torch' }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm10.0' }}
+      PER_FILE: ${{ inputs.tests_per_file || '0' }}
+      PYTEST_K: ${{ inputs.pytest_k || '' }}
+      HOST_CXX: ${{ inputs.host_cxx || 'clang' }}
+      LABEL: ${{ inputs.label || 'release' }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
+      SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
+      VENV: ${{ github.workspace }}/../venv
+      OUT: ${{ github.workspace }}/../devlab-out
+      PYTORCH_ROCM_ARCH: ${{ matrix.gfx }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || '' }}
+          persist-credentials: false
+
+      - name: Write the test sampler
+        run: |
+          # A pytest plugin that keeps a deterministic sample at collection time,
+          # so node ids never pass through the shell.
+          mkdir -p "$SAMPLER_DIR" "$OUT"
+          cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
+          import os
+          from collections import defaultdict
+
+
+          def pytest_collection_modifyitems(config, items):
+              per = int(os.environ.get("DEVLAB_PER") or 0)
+              if per <= 0:
+                  return
+              by_file = os.environ.get("DEVLAB_GROUP", "function") == "file"
+              groups = defaultdict(list)
+              for item in items:
+                  nodeid = item.nodeid
+                  groups[nodeid.split("::")[0] if by_file else nodeid.split("[")[0]].append(item)
+              keep = set()
+              for members in groups.values():
+                  step = max(1, len(members) // per)
+                  keep.update(id(i) for i in members[::step][:per])
+              config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
+              items[:] = [i for i in items if id(i) in keep]
+          PY
+
+      - name: Install torch and the ROCm toolchain
+        run: |
+          set -euo pipefail
+          python3 -m venv "$VENV"
+          . "$VENV/bin/activate"
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          INDEX="$TORCH_INDEX_URL"
+          # A runner pool with a package mirror maps public indexes to it with the
+          # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
+          # Unset, the index is used as given.
+          EXTRA=()
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx_in="$INDEX"
+            # A value is a mirror URL, or a list [index, extra index, ...] when the
+            # mirror serves the index's packages from more than one repository.
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"
+            INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+            [ "$INDEX" = "$idx_in" ] && [ ${#idx[@]} -eq 1 ] || echo "torch index mapped: $idx_in -> $INDEX${EXTRA:+ (extra: ${idx[*]:1})}"
+          fi
+          echo "torch: $spec from $INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an
+          # extra index, and PyPI's newer CUDA torch then outranks the ROCm build.
+          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" --index-url "$INDEX" "${EXTRA[@]}"
+          # The compiler. torch builds that depend on AMD's pip ROCm SDK (rocm==X)
+          # get the SDK's development package of the same version (hipcc, headers,
+          # hipBLAS), as upstream's wheel build does; exllamav3's
+          # use_rocm_sdk_devel() finds it. torch builds that bundle their ROCm
+          # libraries need the host's ROCm install.
+          rocm_ver=$(python -c 'import importlib.metadata as m
+          try: print(m.version("rocm"))
+          except m.PackageNotFoundError: pass')
+          if [ -n "$rocm_ver" ]; then
+            echo "ROCm SDK $rocm_ver: adding rocm[devel]"
+            PIP_CONFIG_FILE=/dev/null pip install -q "rocm[devel]==$rocm_ver" --index-url "$INDEX" "${EXTRA[@]}"
+            python -m rocm_sdk init
+            root=$(python -m rocm_sdk path --root)
+            toolchain="rocm-sdk $rocm_ver"
+          else
+            root=/opt/rocm
+            [ -x "$root/bin/hipcc" ] || { echo "::error::torch bundles ROCm and the host has no $root/bin/hipcc"; exit 1; }
+            echo "ROCM_HOME=$root" >> "$GITHUB_ENV"
+            toolchain="host $(cat "$root/.info/version" 2>/dev/null || readlink -f "$root")"
+          fi
+          echo "toolchain: $toolchain ($root)"
+          echo "$toolchain" > "$OUT/toolchain.txt"
+          "$root/bin/hipcc" --version | head -3 || true
+          if [ "$HOST_CXX" = clang ]; then
+            # The ROCm build force-includes rocm/compat.h (and with it
+            # hip/hip_bf16.h, which uses clang-only builtins) into the host .cpp
+            # files too, so g++ cannot build them (upstream #459, #479).
+            cxx=$(ls "$root"/lib/llvm/bin/clang++ "$root"/llvm/bin/clang++ 2>/dev/null | head -n1 || true)
+            [ -n "$cxx" ] || { echo "::error::no clang++ under $root"; exit 1; }
+            echo "CXX=$cxx" >> "$GITHUB_ENV"
+            echo "CC=${cxx%++}" >> "$GITHUB_ENV"
+            echo "host C++: $cxx"
+          fi
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|triton-rocm|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$RUNNER_TEMP/torch-pin.txt" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import torch
+          assert torch.version.hip, f"not a ROCm build of torch: {torch.__version__}"
+          p = torch.cuda.get_device_properties(0)
+          print(torch.__version__, torch.version.hip, p.name, p.gcnArchName)
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          PY
+
+      - name: Build the extension (${{ matrix.gfx }})
+        id: build
+        run: |
+          set -euo pipefail
+          . "$VENV/bin/activate"
+          pip install -q -r requirements.txt pytest pytest-timeout setuptools wheel
+          # hipcc processes take a few GB each on the large kernel units; keep the
+          # R9700 VM (32 GB) out of the OOM killer.
+          mem_gb=$(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo)
+          jobs=$(( mem_gb / 4 )); [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$(nproc)" ] || jobs=$(nproc)
+          echo "MAX_JOBS=$jobs (${mem_gb} GB RAM, $(nproc) CPUs), PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH, CXX=${CXX:-c++}"
+          start=$(date +%s)
+          rc=0
+          MAX_JOBS=$jobs pip install --no-build-isolation --no-deps -v . > "$OUT/build.log" 2>&1 || rc=$?
+          echo "$(( $(date +%s) - start ))" > "$OUT/build-seconds.txt"
+          tail -n 40 "$OUT/build.log"
+          if [ "$rc" -ne 0 ]; then
+            # The first compiler errors, with file and line, for the summary.
+            grep -E '(error|fatal error):' "$OUT/build.log" | grep -v '^ninja: build stopped' | head -n 20 > "$OUT/build-errors.txt" || true
+            echo "::group::compiler errors"; cat "$OUT/build-errors.txt"; echo "::endgroup::"
+            cp "$OUT/build.log" build.log
+            exit "$rc"
+          fi
+
+      - name: Load the extension on the GPU
+        id: smoke
+        run: |
+          set -euo pipefail
+          . "$VENV/bin/activate"
+          cd "$RUNNER_TEMP"   # import the installed package, not the checkout
+          python -u - <<'PY'
+          import faulthandler, json, os
+          faulthandler.enable()
+          import torch, exllamav3, exllamav3_ext
+          p = torch.cuda.get_device_properties(0)
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "exllamav3": exllamav3.__version__,
+                  "ext": exllamav3_ext.__file__,
+                  "toolchain": open(os.path.join(os.environ["OUT"], "toolchain.txt")).read().strip(),
+                  "cxx": os.environ.get("CXX", "c++")}
+          print(info)
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          # One HIP kernel from the extension against torch: RMSNorm.
+          x = torch.randn(64, 4096, dtype=torch.half, device="cuda")
+          w = torch.randn(4096, dtype=torch.half, device="cuda")
+          y = torch.empty_like(x)
+          exllamav3_ext.rms_norm(x, w, y, 1e-6, 0.0, 1.0, False, False)
+          ref = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6) * w.float()).half()
+          err = (y.float() - ref.float()).abs().max().item()
+          info["smoke_rms_norm_max_abs_err"] = err
+          print("rms_norm max abs err", err)
+          json.dump(info, open(os.path.join(os.environ["OUT"], "env.json"), "w"))
+          assert err < 0.05, err
+          PY
+
+      - name: Tests (self-contained tier)
+        run: |
+          set -euo pipefail
+          . "$VENV/bin/activate"
+          # The tests import the checkout; the compiled extension comes from the
+          # installed package. Serial: the cases share one GPU.
+          k=()
+          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
+          # The exit code is judged in the next step, against the known failures.
+          rc=0
+          PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
+            python -m pytest tests -m "not model" --device cuda:0 -p devlab_sample -q -rfE \
+            --timeout=900 --junitxml="$OUT/junit.xml" "${k[@]}" || rc=$?
+          echo "$rc" > "$OUT/pytest-rc.txt"
+          echo "pytest exit code $rc"
+
+      - name: Judge results
+        id: judge
+        if: always()
+        run: |
+          python3 - <<'PY'
+          # Failures listed in .github/devlab-known-failures.txt (classified as
+          # upstream bugs) are warnings; any other failure, or tests that could not
+          # run at all, fail the job.
+          import fnmatch, json, os, sys, xml.etree.ElementTree as ET
+          out = os.environ["OUT"]
+          known = []
+          try:
+              for line in open(".github/devlab-known-failures.txt"):
+                  line = line.split("#", 1)[0].strip() if line.lstrip().startswith("#") else line.strip()
+                  if not line:
+                      continue
+                  parts = [x.strip() for x in line.split("|")]
+                  known.append((parts[0], parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "not filed"))
+          except FileNotFoundError:
+              pass
+          try:
+              rc = int(open(os.path.join(out, "pytest-rc.txt")).read())
+          except Exception:
+              rc = None
+          failed = []
+          junit = os.path.join(out, "junit.xml")
+          if os.path.exists(junit):
+              for tc in ET.parse(junit).getroot().iter("testcase"):
+                  if tc.find("failure") is not None or tc.find("error") is not None:
+                      f = tc.get("file") or ""
+                      cls = tc.get("classname", "")
+                      path = cls.split(".")
+                      # junit classname is dotted (tests.kernels.x.test_y[.Class]); rebuild the node id
+                      mod = [i for i, part in enumerate(path) if part.startswith("test_")]
+                      if mod:
+                          i = mod[0]
+                          nid = "/".join(path[:i + 1]) + ".py" + "".join("::" + c for c in path[i + 1:]) + "::" + tc.get("name", "")
+                      else:
+                          nid = f"{cls}::{tc.get('name', '')}"
+                      failed.append(nid)
+          known_hits, new = [], []
+          summ = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          for nid in failed:
+              m = next((k for k in known if fnmatch.fnmatch(nid, k[0])), None)
+              if m:
+                  known_hits.append(nid)
+                  print(f"::warning title=Known upstream failure::{nid} — {m[1]} ({m[2]})")
+                  summ.write(f"- known upstream failure: `{nid}` — {m[1]} ({m[2]})\n")
+              else:
+                  new.append(nid)
+                  print(f"::error title=New failure::{nid}")
+                  summ.write(f"- **new failure**: `{nid}`\n")
+          broken = rc is None or rc not in (0, 1) or not os.path.exists(junit) or (rc == 1 and not failed)
+          verdict = "fail" if broken or new else ("known-failures" if known_hits else "pass")
+          if broken:
+              print(f"::error::tests did not run to completion (pytest exit code {rc}, junit {'present' if os.path.exists(junit) else 'missing'})")
+          json.dump({"verdict": verdict, "known_failures": known_hits, "new_failures": new, "pytest_rc": rc},
+                    open(os.path.join(out, "verdict.json"), "w"))
+          print(f"verdict: {verdict} ({len(known_hits)} known, {len(new)} new)")
+          sys.exit(1 if verdict == "fail" else 0)
+          PY
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, xml.etree.ElementTree as ET
+          out = os.environ["OUT"]
+          def load(p):
+              try:
+                  return json.load(open(os.path.join(out, p)))
+              except Exception:
+                  return None
+          def read(p):
+              try:
+                  return open(os.path.join(out, p)).read().strip()
+              except Exception:
+                  return None
+          tests = None
+          if os.path.exists(os.path.join(out, "junit.xml")):
+              s = ET.parse(os.path.join(out, "junit.xml")).getroot()
+              s = s if s.tag == "testsuite" else s.find("testsuite")
+              n = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+              tests = {"ran": n["tests"], "failed": n["failures"], "errors": n["errors"],
+                       "skipped": n["skipped"],
+                       "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
+                       "seconds": round(float(s.get("time", 0)), 1)}
+          env = load("env.json") or {}
+          errors = read("build-errors.txt")
+          build = {"outcome": "${{ steps.build.outcome }}", "seconds": read("build-seconds.txt"),
+                   "toolchain": read("toolchain.txt"), "cxx": os.environ.get("CXX", "c++"),
+                   "errors": errors.splitlines() if errors else None}
+          summary = {
+              "schema": 1, "project": "exllamav3", "label": os.environ["LABEL"],
+              "release": env.get("exllamav3", "${{ github.event.release.tag_name || inputs.ref || github.sha }}"),
+              "combo": f"torch{(env.get('torch') or '?')}",
+              "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
+              "gfx": "${{ matrix.gfx }}", "env": env or None, "build": build,
+              "smoke": "${{ steps.smoke.outcome }}", "tests": tests,
+              "verdict": (load("verdict.json") or {}).get("verdict", "fail"),
+              "known_failures": (load("verdict.json") or {}).get("known_failures", []),
+              "new_failures": (load("verdict.json") or {}).get("new_failures", []),
+              "job_status": "${{ job.status }}",
+              "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+          }
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          print(json.dumps(summary, indent=1))
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-${{ inputs.label || 'release' }}-${{ strategy.job-index }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: summary.json
+          retention-days: 90
+
+      - name: Upload the build log
+        if: failure() && steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.label || 'release' }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: build.log
+          retention-days: 30
