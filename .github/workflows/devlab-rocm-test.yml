@@ -167,7 +167,7 @@ jobs:
             docker run --rm --network host "$img" tar -C "$real" -cf - \
                 --exclude='lib/rocblas/library' --exclude='lib/hipblaslt/library' \
                 --exclude='lib/hipsparselt/library' --exclude='share/miopen' --exclude='lib/rocfft' \
-                --exclude='share/doc' --exclude='lib/*.a' . | tar -C "$root" -xf -
+                --exclude='share/doc' . | tar -C "$root" -xf -
             [ -x "$root/bin/hipcc" ] || { echo "::error::no hipcc in $img"; exit 1; }
             { echo "ROCM_HOME=$root"; echo "ROCM_PATH=$root"; echo "HIP_PATH=$root"; } >> "$GITHUB_ENV"
             export ROCM_PATH="$root" HIP_PATH="$root"
